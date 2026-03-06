@@ -4,7 +4,25 @@ import logger from "../logger";
 
 const log = logger.child({ service: "handler" });
 
-const DEDUP_WINDOW_MS = 60_000; // 1 minute
+const DEDUP_WINDOW_MS = 60_000;
+
+const HELP_TEXT = `🤖 **CodeLark** — AI Coding Assistant
+
+**Commands:**
+/help — Show this help message
+/new — Reset conversation and start fresh
+
+**Usage:**
+• In group chats: @mention me with your question
+• In DMs: Send messages directly
+
+**What I can do:**
+• Read and analyze code projects
+• Write, refactor, and debug code
+• Run commands and tests
+• Answer programming questions
+
+Powered by OpenCode.`;
 
 export class MessageHandler {
   private feishu: FeishuService;
@@ -14,16 +32,10 @@ export class MessageHandler {
   constructor(feishu: FeishuService, opencode: OpenCodeService) {
     this.feishu = feishu;
     this.opencode = opencode;
-
-    // Clean up old message IDs periodically
     setInterval(() => this.cleanupDedup(), DEDUP_WINDOW_MS);
   }
 
-  /**
-   * Handle incoming Feishu message event
-   */
   handle = (data: FeishuMessageData): void => {
-    // Fire-and-forget to avoid blocking Feishu ACK
     this.processMessage(data).catch((err) => {
       log.error({ err }, "Unhandled error in message processing");
     });
@@ -33,15 +45,16 @@ export class MessageHandler {
     const { message } = data;
     const messageId = message.message_id;
     const chatId = message.chat_id;
+    const chatType = message.chat_type; // "group" or "p2p"
 
-    // Deduplication: skip if we've seen this message recently
+    // Deduplication
     if (this.recentMessageIds.has(messageId)) {
       log.debug({ messageId }, "Duplicate message, skipping");
       return;
     }
     this.recentMessageIds.set(messageId, Date.now());
 
-    // Parse message content
+    // Parse text content
     let text = "";
     try {
       const contentObj = JSON.parse(message.content);
@@ -50,14 +63,54 @@ export class MessageHandler {
       text = message.content || "";
     }
 
+    // In group chats, only respond to @mentions
+    // Feishu includes @mention as @_user_1 in text, strip it out
+    if (chatType === "group") {
+      if (!text.includes("@_user_1")) {
+        log.debug({ messageId }, "Group message without @mention, skipping");
+        return;
+      }
+      // Remove the @mention tag from the text
+      text = text.replace(/@_user_\d+/g, "").trim();
+    }
+
     if (!text.trim()) {
       log.debug({ messageId }, "Empty message, skipping");
       return;
     }
 
+    // Handle slash commands
+    const command = text.trim().toLowerCase();
+
+    if (command === "/help") {
+      await this.feishu.replyMessage(messageId, HELP_TEXT);
+      return;
+    }
+
+    if (command === "/new") {
+      this.opencode.clearSession(chatId);
+      await this.feishu.replyMessage(
+        messageId,
+        "🔄 Session reset. Starting a fresh conversation!",
+      );
+      log.info({ chatId }, "Session manually reset");
+      return;
+    }
+
     log.info({ messageId, text: text.substring(0, 100) }, "Processing message");
 
-    // Forward to OpenCode (per-chat session for context preservation)
+    // Send "Thinking..." status immediately
+    let thinkingMessageId: string | null = null;
+    try {
+      thinkingMessageId = await this.feishu.replyMessage(
+        messageId,
+        "🤔 Thinking...",
+      );
+    } catch (err: any) {
+      log.warn({ err: err.message }, "Failed to send thinking status");
+    }
+
+    // Forward to OpenCode
     const reply = await this.opencode.sendMessage(chatId, text);
 
     log.info(
@@ -65,15 +118,32 @@ export class MessageHandler {
       "Received OpenCode reply",
     );
 
-    // Send reply back to Feishu
+    // Try to update the "Thinking..." message, fallback to new reply
     try {
-      await this.feishu.sendMessage(chatId, reply);
-      log.info({ messageId, chatId }, "Reply sent");
+      if (thinkingMessageId && reply.length <= 4000) {
+        await this.feishu.updateMessage(thinkingMessageId, reply);
+      } else {
+        // Reply is too long for update (needs splitting) or no thinking message
+        if (thinkingMessageId) {
+          await this.feishu.updateMessage(
+            thinkingMessageId,
+            "✅ Done — see full response below:",
+          );
+        }
+        await this.feishu.replyMessage(messageId, reply);
+      }
+      log.info({ messageId, chatId }, "Reply delivered");
     } catch (err: any) {
       log.error(
         { err: err.message, messageId, chatId },
-        "Failed to send reply",
+        "Failed to deliver reply",
       );
+      // Last resort: try sending as a new message to the chat
+      try {
+        await this.feishu.sendMessage(chatId, reply);
+      } catch {
+        log.error({ chatId }, "Failed to deliver reply by any method");
+      }
     }
   }
 

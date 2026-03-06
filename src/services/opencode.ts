@@ -225,6 +225,17 @@ export class OpenCodeService {
 
   // ─── Status & Lifecycle ────────────────────────────────────────────
 
+  /**
+   * Clear the session for a specific chat (used by /new command)
+   */
+  clearSession(chatId: string): void {
+    const sessionId = this.sessions.get(chatId);
+    if (sessionId) {
+      this.sessions.delete(chatId);
+      log.info({ chatId, sessionId }, "Session cleared");
+    }
+  }
+
   getStatus(): OpenCodeStatus {
     return {
       running: this.process !== null,
