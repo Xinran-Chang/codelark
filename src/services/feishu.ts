@@ -73,6 +73,56 @@ export class FeishuService {
   }
 
   /**
+   * Convert standard Markdown to Feishu card-compatible Markdown.
+   * Feishu cards only support: bold, italic, strikethrough, links,
+   * lists, and inline code. Headers, code blocks, tables, and
+   * horizontal rules are NOT supported.
+   */
+  private sanitizeMarkdown(md: string): string {
+    return (
+      md
+        // Convert headers (# ~ ######) to bold text
+        .replace(/^(#{1,6})\s+(.+)$/gm, (_match, _hashes, text) => {
+          return `**${text.trim()}**`;
+        })
+        // Convert fenced code blocks (```lang ... ```) to plain text with markers
+        .replace(/```[\w]*\n([\s\S]*?)```/g, (_match, code) => {
+          // Indent code lines and wrap with visual markers
+          const lines = code.trimEnd().split("\n");
+          return (
+            "📝 **Code:**\n" + lines.map((l: string) => `  ${l}`).join("\n")
+          );
+        })
+        // Convert horizontal rules (--- / *** / ___) to a visual separator
+        .replace(/^[-*_]{3,}\s*$/gm, "───────────────────")
+    );
+  }
+
+  /**
+   * Build the JSON structure for a Markdown message card
+   */
+  private buildCardContent(content: string, title?: string): string {
+    return JSON.stringify({
+      config: {
+        wide_screen_mode: true,
+      },
+      header: {
+        title: {
+          tag: "plain_text",
+          content: title || "CodeLark",
+        },
+        template: "purple",
+      },
+      elements: [
+        {
+          tag: "markdown",
+          content: this.sanitizeMarkdown(content) || " ",
+        },
+      ],
+    });
+  }
+
+  /**
    * Send a text message to a Feishu chat
    */
   async sendMessage(chatId: string, content: string): Promise<string> {
@@ -89,8 +139,8 @@ export class FeishuService {
         params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
-          content: JSON.stringify({ text }),
-          msg_type: "text",
+          content: this.buildCardContent(text),
+          msg_type: "interactive",
         },
       });
 
@@ -119,8 +169,8 @@ export class FeishuService {
       const result: any = await this.client.im.message.reply({
         path: { message_id: messageId },
         data: {
-          content: JSON.stringify({ text }),
-          msg_type: "text",
+          content: this.buildCardContent(text),
+          msg_type: "interactive",
         },
       });
 
@@ -140,7 +190,7 @@ export class FeishuService {
     await this.client.im.message.patch({
       path: { message_id: messageId },
       data: {
-        content: JSON.stringify({ text: content }),
+        content: this.buildCardContent(content),
       },
     });
     log.debug({ messageId }, "Message updated");

@@ -110,26 +110,38 @@ export class MessageHandler {
       log.warn({ err: err.message }, "Failed to send thinking status");
     }
 
-    // Forward to OpenCode
-    const reply = await this.opencode.sendMessage(chatId, text);
+    // Progress callback: update the card with streaming text
+    const onProgress = (text: string) => {
+      if (!thinkingMessageId) return;
+      const display =
+        text.length > 20000
+          ? text.substring(0, 20000) +
+            "\n\n_...truncated, full response on completion_"
+          : text;
+      this.feishu
+        .updateMessage(thinkingMessageId, display + "\n\n⏳ _Working..._")
+        .catch((err) =>
+          log.debug({ err: err.message }, "Progress card update failed"),
+        );
+    };
+
+    // Forward to OpenCode with streaming updates
+    const reply = await this.opencode.sendMessageStreaming(
+      chatId,
+      text,
+      onProgress,
+    );
 
     log.info(
       { messageId, replyLength: reply.length },
       "Received OpenCode reply",
     );
 
-    // Try to update the "Thinking..." message, fallback to new reply
+    // Final delivery
     try {
-      if (thinkingMessageId && reply.length <= 4000) {
+      if (thinkingMessageId) {
         await this.feishu.updateMessage(thinkingMessageId, reply);
       } else {
-        // Reply is too long for update (needs splitting) or no thinking message
-        if (thinkingMessageId) {
-          await this.feishu.updateMessage(
-            thinkingMessageId,
-            "✅ Done — see full response below:",
-          );
-        }
         await this.feishu.replyMessage(messageId, reply);
       }
       log.info({ messageId, chatId }, "Reply delivered");

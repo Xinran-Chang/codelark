@@ -194,7 +194,7 @@ export class OpenCodeService {
       const { data } = await this.http.post(
         `/session/${sessionId}/message`,
         { parts: [{ type: "text", text: message }] },
-        { timeout: 120_000 },
+        { timeout: 600_000 },
       );
 
       let reply = "";
@@ -221,6 +221,205 @@ export class OpenCodeService {
       );
       return `Error: ${err.message}`;
     }
+  }
+
+  /**
+   * Send a message with streaming progress via SSE.
+   * Calls onProgress with accumulated text (throttled to every 3s).
+   * Falls back to synchronous sendMessage if SSE is unavailable.
+   */
+  async sendMessageStreaming(
+    chatId: string,
+    message: string,
+    onProgress?: (text: string) => void,
+  ): Promise<string> {
+    const sessionId = await this.getSession(chatId);
+    if (!sessionId) return "Error: OpenCode service unavailable";
+
+    const baseUrl = `http://localhost:${config.opencode.port}`;
+    const abort = new AbortController();
+    const textParts = new Map<string, string>();
+    let settled = false;
+
+    const getText = () => Array.from(textParts.values()).join("\n\n").trim();
+
+    // Throttle progress emissions to every 3 seconds
+    let lastEmit = 0;
+    let emitTimer: ReturnType<typeof setTimeout> | null = null;
+    const THROTTLE_MS = 3000;
+
+    const emitProgress = () => {
+      if (!onProgress) return;
+      const text = getText();
+      if (!text) return;
+      const now = Date.now();
+      if (now - lastEmit >= THROTTLE_MS) {
+        lastEmit = now;
+        if (emitTimer) {
+          clearTimeout(emitTimer);
+          emitTimer = null;
+        }
+        onProgress(text);
+      } else if (!emitTimer) {
+        emitTimer = setTimeout(
+          () => {
+            emitTimer = null;
+            lastEmit = Date.now();
+            const t = getText();
+            if (t) onProgress(t);
+          },
+          THROTTLE_MS - (now - lastEmit),
+        );
+      }
+    };
+
+    return new Promise<string>(async (resolve) => {
+      // Hard timeout: 10 minutes
+      const hardTimer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          if (emitTimer) clearTimeout(emitTimer);
+          abort.abort();
+          resolve(getText() || "Error: Request timed out");
+        }
+      }, 600_000);
+
+      const finish = (text?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(hardTimer);
+        if (emitTimer) clearTimeout(emitTimer);
+        abort.abort();
+        resolve(text || getText() || "OpenCode processed (no text reply)");
+      };
+
+      try {
+        // 1. Connect to SSE event stream before sending prompt
+        const sse = await fetch(`${baseUrl}/global/event`, {
+          signal: abort.signal,
+          headers: { Accept: "text/event-stream" },
+        });
+
+        if (!sse.ok || !sse.body) {
+          clearTimeout(hardTimer);
+          settled = true;
+          log.warn("SSE unavailable, falling back to sync");
+          resolve(await this.sendMessage(chatId, message));
+          return;
+        }
+
+        // 2. Fire async prompt (returns immediately)
+        try {
+          await this.http.post(
+            `/session/${sessionId}/prompt_async`,
+            { parts: [{ type: "text", text: message }] },
+            { timeout: 10_000 },
+          );
+        } catch (err: any) {
+          clearTimeout(hardTimer);
+          abort.abort();
+          if (err.response?.status === 404) {
+            this.sessions.delete(chatId);
+            settled = true;
+            resolve(
+              await this.sendMessageStreaming(chatId, message, onProgress),
+            );
+            return;
+          }
+          settled = true;
+          resolve(`Error: ${err.message}`);
+          return;
+        }
+
+        log.info({ sessionId }, "Streaming prompt started");
+
+        // 3. Parse SSE stream for text updates and session completion
+        const reader = sse.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+
+        try {
+          while (!settled) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buf += decoder.decode(value, { stream: true });
+            const blocks = buf.split("\n\n");
+            buf = blocks.pop() || "";
+
+            for (const block of blocks) {
+              if (settled) break;
+              for (const line of block.split("\n")) {
+                if (!line.startsWith("data:")) continue;
+                try {
+                  const evt = JSON.parse(line.slice(5).trim());
+                  const { type, properties: p } = evt?.payload ?? {};
+                  if (!p) continue;
+
+                  if (
+                    type === "message.part.delta" &&
+                    p.sessionID === sessionId &&
+                    p.field === "text"
+                  ) {
+                    // Accumulate incremental text by partID
+                    const prev = textParts.get(p.partID) || "";
+                    textParts.set(p.partID, prev + (p.delta || ""));
+                    emitProgress();
+                  } else if (
+                    type === "session.idle" &&
+                    p.sessionID === sessionId
+                  ) {
+                    finish();
+                  }
+                } catch {}
+              }
+            }
+          }
+        } catch (err: any) {
+          if (err.name !== "AbortError") {
+            log.warn({ err: err.message }, "SSE read error");
+          }
+        }
+
+        // Stream ended — if not yet settled, fetch final messages
+        if (!settled) {
+          try {
+            const { data: msgs } = await this.http.get(
+              `/session/${sessionId}/message`,
+              { timeout: 10_000 },
+            );
+            if (Array.isArray(msgs)) {
+              const last = msgs
+                .filter((m: any) => m.info?.role === "assistant")
+                .pop();
+              if (last?.parts) {
+                const text = last.parts
+                  .filter((p: any) => p.type === "text" && p.text)
+                  .map((p: any) => p.text)
+                  .join("\n\n")
+                  .trim();
+                if (text) {
+                  finish(text);
+                  return;
+                }
+              }
+            }
+          } catch {}
+          finish();
+        }
+      } catch (err: any) {
+        clearTimeout(hardTimer);
+        if (err.name !== "AbortError") {
+          log.error({ err: err.message }, "Streaming setup failed");
+        }
+        settled = true;
+        try {
+          resolve(await this.sendMessage(chatId, message));
+        } catch {
+          resolve(getText() || "Error: Streaming failed");
+        }
+      }
+    });
   }
 
   // ─── Status & Lifecycle ────────────────────────────────────────────
